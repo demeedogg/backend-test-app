@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +17,8 @@ from urllib.parse import urlsplit
 LOGGER = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_SUBMISSIONS = 3
+MAX_CONCURRENT_REQUESTS = 32
+REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_DATABASE_PATH = "/data/contact-submissions.sqlite"
 EMAIL_LOCAL_PART = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$")
 EMAIL_DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -131,6 +134,61 @@ def persist_submission(database_path: str | Path, name: str, email: str) -> None
         connection.close()
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Limit active request threads and the time each client can hold one."""
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler: type[BaseHTTPRequestHandler],
+        max_concurrent_requests: int = MAX_CONCURRENT_REQUESTS,
+        request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        if max_concurrent_requests < 1:
+            raise ValueError("max_concurrent_requests must be positive")
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        self._request_timeout_seconds = request_timeout_seconds
+        super().__init__(server_address, request_handler)
+
+    def get_request(self) -> tuple[Any, Any]:
+        request, client_address = super().get_request()
+        request.settimeout(self._request_timeout_seconds)
+        return request, client_address
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            body = b'{"error":"service_busy"}'
+            response = (
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                b"Cache-Control: no-store\r\n"
+                b"Connection: close\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                + body
+            )
+            try:
+                request.sendall(response)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 class ContactSubmissionHandler(BaseHTTPRequestHandler):
     """Handle the single public contact-submission operation."""
 
@@ -197,7 +255,7 @@ class ContactSubmissionHandler(BaseHTTPRequestHandler):
                 return
             try:
                 payload = json.loads(raw_body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
+            except (ValueError, RecursionError):
                 self._send_json(
                     400,
                     {
@@ -250,13 +308,20 @@ def create_server(
     host: str,
     port: int,
     database_path: str | Path,
-) -> ThreadingHTTPServer:
+    max_concurrent_requests: int = MAX_CONCURRENT_REQUESTS,
+    request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+) -> BoundedThreadingHTTPServer:
     handler = type(
         "ConfiguredContactSubmissionHandler",
         (ContactSubmissionHandler,),
         {"database_path": str(database_path)},
     )
-    server = ThreadingHTTPServer((host, port), handler)
+    server = BoundedThreadingHTTPServer(
+        (host, port),
+        handler,
+        max_concurrent_requests=max_concurrent_requests,
+        request_timeout_seconds=request_timeout_seconds,
+    )
     server.daemon_threads = True
     return server
 

@@ -14,7 +14,12 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app import ContactSubmissionHandler, create_server, initialize_database
+from app import (
+    MAX_REQUEST_BYTES,
+    ContactSubmissionHandler,
+    create_server,
+    initialize_database,
+)
 
 
 class ContactSubmissionTests(unittest.TestCase):
@@ -34,9 +39,13 @@ class ContactSubmissionTests(unittest.TestCase):
         self.server.shutdown()
         self.thread.join(timeout=5)
 
-    def request(self, payload: object) -> tuple[int, dict[str, object]]:
+    def request(
+        self,
+        payload: object,
+        base_url: str | None = None,
+    ) -> tuple[int, dict[str, object]]:
         request = Request(
-            f"{self.base_url}/api/contact-submissions",
+            f"{base_url or self.base_url}/api/contact-submissions",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -48,9 +57,14 @@ class ContactSubmissionTests(unittest.TestCase):
         with response:
             return response.status, json.loads(response.read())
 
-    def raw_request(self, body: bytes, content_type: str = "application/json") -> int:
+    def raw_request(
+        self,
+        body: bytes,
+        content_type: str = "application/json",
+        base_url: str | None = None,
+    ) -> int:
         request = Request(
-            f"{self.base_url}/api/contact-submissions",
+            f"{base_url or self.base_url}/api/contact-submissions",
             data=body,
             headers={"Content-Type": content_type},
             method="POST",
@@ -130,6 +144,74 @@ class ContactSubmissionTests(unittest.TestCase):
                 201,
             )
         self.assertEqual(self.row_count(), 3)
+
+    def test_oversized_body_is_rejected_before_validation_or_persistence(self) -> None:
+        with patch("app.validate_submission") as validate, patch(
+            "app.persist_submission"
+        ) as persist:
+            status = self.raw_request(b"x" * (MAX_REQUEST_BYTES + 1))
+
+        self.assertEqual(status, 413)
+        validate.assert_not_called()
+        persist.assert_not_called()
+        self.assertEqual(self.row_count(), 0)
+
+    def test_json_parser_complexity_errors_are_client_errors(self) -> None:
+        deeply_nested = b"[" * 2_000 + b"]" * 2_000
+        oversized_integer = (
+            b'{"name":' + b"9" * 5_000 + b',"email":"person@example.com"}'
+        )
+
+        self.assertLessEqual(len(deeply_nested), MAX_REQUEST_BYTES)
+        self.assertLessEqual(len(oversized_integer), MAX_REQUEST_BYTES)
+        self.assertEqual(self.raw_request(deeply_nested), 400)
+        self.assertEqual(self.raw_request(oversized_integer), 400)
+        self.assertEqual(self.row_count(), 0)
+
+    def test_concurrency_limit_rejects_before_persistence(self) -> None:
+        server = create_server(
+            "127.0.0.1",
+            0,
+            self.database_path,
+            max_concurrent_requests=1,
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(
+            lambda: (server.shutdown(), server_thread.join(timeout=5))
+        )
+        server_url = f"http://127.0.0.1:{server.server_port}"
+        persistence_started = threading.Event()
+        release_persistence = threading.Event()
+
+        def block_persistence(*_args: object) -> None:
+            persistence_started.set()
+            if not release_persistence.wait(timeout=5):
+                raise TimeoutError("test did not release persistence")
+
+        with patch("app.persist_submission", side_effect=block_persistence) as persist:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                accepted_request = executor.submit(
+                    self.request,
+                    {"name": "First", "email": "first@example.com"},
+                    server_url,
+                )
+                self.assertTrue(persistence_started.wait(timeout=5))
+                try:
+                    status, response = self.request(
+                        {"name": "Second", "email": "second@example.com"},
+                        server_url,
+                    )
+                    self.assertEqual(status, 503)
+                    self.assertEqual(response, {"error": "service_busy"})
+                    persist.assert_called_once()
+                finally:
+                    release_persistence.set()
+
+                self.assertEqual(accepted_request.result(timeout=5)[0], 201)
+
+        self.assertEqual(self.row_count(), 0)
 
     def test_missing_fields_return_field_specific_validation_details(self) -> None:
         status, response = self.request({})

@@ -21,6 +21,13 @@ Configuration:
 | `PORT` | `3000` | HTTP listen port, from 1 through 65535. |
 | `LOG_LEVEL` | `INFO` | Python logging level. Persistence failures include details only in server logs. |
 
+The service accepts request bodies up to 16 KiB, handles at most 32 client
+requests concurrently, and closes a client connection after 10 seconds without
+socket activity. When all request slots are occupied, additional requests are
+rejected with HTTP `503` and `{"error":"service_busy"}` before validation or
+persistence runs. These finite transport limits keep malformed or stalled
+clients from consuming unbounded request memory, processing, or worker threads.
+
 The schema is initialized at service startup. Keep the configured database file
 on writable persistent storage to preserve the service-lifetime count across
 restarts. The deployment assumes one backend instance; all workers within that
@@ -72,6 +79,7 @@ Errors are always unsuccessful responses:
 | `400 Bad Request` | Missing, non-string, empty, or out-of-range fields | `{"error":"validation_error","fields":{"name":"Name must contain 1 to 100 characters."}}`; the `fields` object contains all invalid fields. Missing/non-string fields say `Name must be a string.` or `Email must be a string.`; invalid email syntax/length says `Enter a valid email address of at most 254 characters.` |
 | `400 Bad Request` | Missing, invalid, or incomplete `Content-Length` | `{"error":"invalid_request","message":"Content-Length is required."}` (message distinguishes the invalid or incomplete cases) |
 | `409 Conflict` | Three submissions have already committed | `{"error":"submission_limit_reached"}` |
+| `503 Service Unavailable` | All 32 request slots are occupied | `{"error":"service_busy"}` |
 | `413 Content Too Large` | Request body exceeds 16 KiB | `{"error":"request_too_large"}` |
 | `415 Unsupported Media Type` | Request is not JSON | `{"error":"unsupported_media_type"}` |
 | `500 Internal Server Error` | Persistence or other operational failure | `{"error":"internal_error","message":"Unable to process submission."}` |
