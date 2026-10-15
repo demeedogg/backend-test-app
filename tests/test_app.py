@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -212,6 +213,38 @@ class ContactSubmissionTests(unittest.TestCase):
                 self.assertEqual(accepted_request.result(timeout=5)[0], 201)
 
         self.assertEqual(self.row_count(), 0)
+
+    def test_idle_client_timeout_releases_request_slot(self) -> None:
+        server = create_server(
+            "127.0.0.1",
+            0,
+            self.database_path,
+            max_concurrent_requests=1,
+            request_timeout_seconds=0.2,
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(
+            lambda: (server.shutdown(), server_thread.join(timeout=5))
+        )
+
+        with socket.create_connection(
+            ("127.0.0.1", server.server_port), timeout=2
+        ) as client:
+            client.settimeout(2)
+            client.sendall(b"POST /api/contact-submissions HTTP/1.1\r\nHost:")
+            self.assertEqual(client.recv(1), b"")
+
+        self.assertEqual(self.row_count(), 0)
+        self.assertEqual(
+            self.request(
+                {"name": "After timeout", "email": "after@example.com"},
+                f"http://127.0.0.1:{server.server_port}",
+            )[0],
+            201,
+        )
+        self.assertEqual(self.row_count(), 1)
 
     def test_missing_fields_return_field_specific_validation_details(self) -> None:
         status, response = self.request({})
