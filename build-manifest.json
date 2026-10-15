@@ -1,0 +1,6 @@
+{
+  "image": {
+    "name": "backend-test-app",
+    "tag": "persist-and-constrain-contact-submissions"
+  }
+}
